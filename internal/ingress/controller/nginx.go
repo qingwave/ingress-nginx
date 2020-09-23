@@ -86,9 +86,10 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 	n := &NGINXController{
 		isIPV6Enabled: ing_net.IsIPv6Enabled(),
 
-		resolver:        h,
-		cfg:             config,
-		syncRateLimiter: flowcontrol.NewTokenBucketRateLimiter(config.SyncRateLimit, 1),
+		resolver:              h,
+		cfg:                   config,
+		syncRateLimiter:       flowcontrol.NewTokenBucketRateLimiter(config.SyncRateLimit, 1),
+		reloadSyncRateLimiter: flowcontrol.NewTokenBucketRateLimiter(config.ReloadSyncRateLimit, 1),
 
 		recorder: eventBroadcaster.NewRecorder(scheme.Scheme, apiv1.EventSource{
 			Component: "nginx-ingress-controller",
@@ -102,6 +103,10 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		stopLock: &sync.Mutex{},
 
 		runningConfig: new(ingress.Configuration),
+
+		lastReloadConfig: new(ingress.Configuration),
+		reloadCh:         channels.NewRingChannel(1),
+		reloadMaxRetry:   config.ReloadMaxRetry,
 
 		Proxy: &TCPProxy{},
 
@@ -223,7 +228,8 @@ type NGINXController struct {
 
 	syncStatus status.Syncer
 
-	syncRateLimiter flowcontrol.RateLimiter
+	syncRateLimiter       flowcontrol.RateLimiter
+	reloadSyncRateLimiter flowcontrol.RateLimiter
 
 	// stopLock is used to enforce that only a single call to Stop send at
 	// a given time. We allow stopping through an HTTP endpoint and
@@ -238,6 +244,11 @@ type NGINXController struct {
 
 	// runningConfig contains the running configuration in the Backend
 	runningConfig *ingress.Configuration
+
+	// lastReloadConfig contains the last reload configuration in the Backend
+	lastReloadConfig *ingress.Configuration
+	reloadCh         *channels.RingChannel
+	reloadMaxRetry   int
 
 	t ngx_template.TemplateWriter
 
@@ -329,6 +340,30 @@ func (n *NGINXController) Start() {
 			klog.Error(n.validationWebhookServer.ListenAndServeTLS("", ""))
 		}()
 	}
+
+	go func() {
+		for {
+			select {
+			case event := <-n.reloadCh.Out():
+				if n.isShuttingDown {
+					break
+				}
+
+				if evt, ok := event.(ReloadEvent); ok {
+					if evt.Retry > n.reloadMaxRetry {
+						klog.V(2).Infof("Reload configuration retry times %d more than MaxRetry %d, dropping it.", evt.Retry, n.reloadMaxRetry)
+						continue
+					}
+
+					n.reloadIfNecessary(evt)
+				} else {
+					klog.Warningf("Unexpected reload event type received")
+				}
+			case <-n.stopCh:
+				return
+			}
+		}
+	}()
 
 	for {
 		select {

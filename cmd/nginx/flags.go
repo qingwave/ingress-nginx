@@ -137,6 +137,11 @@ extension for this to succeed.`)
 		syncRateLimit = flags.Float32("sync-rate-limit", 0.3,
 			`Define the sync frequency upper limit`)
 
+		reloadSyncRateLimit = flags.Float32("reload-sync-rate-limit", 0.01,
+			`Define the config reload sync frequency upper limit`)
+		reloadMaxRetry = flags.Int("reload-max-retry", 3,
+			`Define the reload retry times when reload failed`)
+
 		publishStatusAddress = flags.String("publish-status-address", "",
 			`Customized address to set as the load-balancer status of Ingress objects this controller satisfies.
 Requires the update-status parameter.`)
@@ -286,6 +291,8 @@ https://blog.maxmind.com/2019/12/18/significant-changes-to-accessing-and-using-g
 		UpdateStatusOnShutdown: *updateStatusOnShutdown,
 		UseNodeInternalIP:      *useNodeInternalIP,
 		SyncRateLimit:          *syncRateLimit,
+		ReloadSyncRateLimit:    *reloadSyncRateLimit,
+		ReloadMaxRetry:         *reloadMaxRetry,
 		ListenPorts: &ngx_config.ListenPorts{
 			Default:  *defServerPort,
 			Health:   *healthzPort,
@@ -301,6 +308,10 @@ https://blog.maxmind.com/2019/12/18/significant-changes-to-accessing-and-using-g
 
 	if *apiserverHost != "" {
 		config.RootCAFile = *rootCAFile
+	}
+
+	if *reloadMaxRetry < 0 {
+		config.ReloadMaxRetry = 0
 	}
 
 	if nginx.MaxmindLicenseKey != "" && nginx.MaxmindEditionIDs != "" {

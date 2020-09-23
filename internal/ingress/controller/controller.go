@@ -93,6 +93,9 @@ type Configuration struct {
 
 	SyncRateLimit float32
 
+	ReloadSyncRateLimit float32
+	ReloadMaxRetry      int
+
 	DisableCatchAll bool
 
 	ValidationWebhook         string
@@ -103,6 +106,11 @@ type Configuration struct {
 	MaxmindEditionFiles []string
 
 	MonitorMaxBatchSize int
+}
+
+type ReloadEvent struct {
+	Obj   *ingress.Configuration
+	Retry int
 }
 
 // GetPublishService returns the Service used to set the load-balancer status of Ingresses.
@@ -138,25 +146,10 @@ func (n *NGINXController) syncIngress(interface{}) error {
 	n.metricCollector.SetHosts(hosts)
 
 	if !n.IsDynamicConfigurationEnough(pcfg) {
-		klog.Infof("Configuration changes detected, backend reload required.")
-
-		hash, _ := hashstructure.Hash(pcfg, &hashstructure.HashOptions{
-			TagName: "json",
-		})
-
-		pcfg.ConfigurationChecksum = fmt.Sprintf("%v", hash)
-
-		err := n.OnUpdate(*pcfg)
-		if err != nil {
-			n.metricCollector.IncReloadErrorCount()
-			n.metricCollector.ConfigSuccess(hash, false)
-			klog.Errorf("Unexpected failure reloading the backend:\n%v", err)
-			return err
+		n.reloadCh.In() <- ReloadEvent{
+			Obj:   pcfg,
+			Retry: 0,
 		}
-
-		klog.Infof("Backend successfully reloaded.")
-		n.metricCollector.ConfigSuccess(hash, true)
-		n.metricCollector.IncReloadCount()
 	}
 
 	isFirstSync := n.runningConfig.Equal(&ingress.Configuration{})
@@ -194,6 +187,46 @@ func (n *NGINXController) syncIngress(interface{}) error {
 	n.metricCollector.RemoveMetrics(ri, re)
 
 	n.runningConfig = pcfg
+	return nil
+}
+
+func (n *NGINXController) reloadIfNecessary(event ReloadEvent) error {
+	pcfg := event.Obj
+	if event.Retry > 0 || !n.reloadSyncRateLimiter.TryAccept() {
+		n.reloadSyncRateLimiter.Accept()
+		ings := n.store.ListIngresses(nil)
+		_, _, pcfg = n.getConfiguration(ings)
+	}
+
+	if n.lastReloadConfig.Equal(pcfg) {
+		klog.V(3).Infof("No configuration change detected, skipping backend reload.")
+		return nil
+	}
+
+	klog.Infof("Configuration changes detected, backend reload required.")
+
+	hash, _ := hashstructure.Hash(pcfg, &hashstructure.HashOptions{
+		TagName: "json",
+	})
+
+	pcfg.ConfigurationChecksum = fmt.Sprintf("%v", hash)
+
+	if err := n.OnUpdate(*pcfg); err != nil {
+		n.metricCollector.IncReloadErrorCount()
+		n.metricCollector.ConfigSuccess(hash, false)
+		klog.Errorf("Unexpected failure reloading the backend:\n%v", err)
+		n.reloadCh.In() <- ReloadEvent{
+			Obj:   pcfg,
+			Retry: event.Retry + 1,
+		}
+		return err
+	}
+
+	klog.Infof("Backend successfully reloaded.")
+	n.metricCollector.ConfigSuccess(hash, true)
+	n.metricCollector.IncReloadCount()
+
+	n.lastReloadConfig = pcfg
 
 	return nil
 }
